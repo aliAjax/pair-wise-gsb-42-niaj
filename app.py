@@ -11,7 +11,9 @@ from difflib import SequenceMatcher
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
+
+from chain_service import ChainError, ChainService
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB = ROOT / "financial_crime.db"
@@ -499,6 +501,9 @@ class FinancialCrimeService:
                 raise DomainError("实体已变化，请刷新后重试", 409)
             conn.execute("UPDATE entities SET frozen=1,risk_level='high',version=version+1,updated_at=? WHERE id=?", (utcnow(), entity["id"]))
             conn.execute("UPDATE transactions SET status='blocked' WHERE entity_id=? AND status IN ('review','allowed')", (entity["id"],))
+            chain_hook = getattr(self, "chain_freeze_hook", None)
+            if chain_hook:
+                chain_hook(conn, entity["id"])
             if case_id is not None:
                 case = conn.execute("SELECT * FROM cases WHERE id=? AND entity_id=?", (case_id, entity["id"])).fetchone()
                 if not case:
@@ -522,6 +527,9 @@ class FinancialCrimeService:
             if entity["version"] != int(expected_version):
                 raise DomainError("实体已变化，请刷新后重试", 409)
             conn.execute("UPDATE entities SET frozen=0,risk_level='medium',version=version+1,updated_at=? WHERE id=?", (utcnow(), entity["id"]))
+            chain_hook = getattr(self, "chain_unfreeze_hook", None)
+            if chain_hook:
+                chain_hook(conn, entity["id"])
             self._audit(conn, actor, "entity.unfrozen", {"reason": reason.strip()}, entity["id"])
             return dict(conn.execute("SELECT * FROM entities WHERE id=?", (entity["id"],)).fetchone())
 
@@ -555,6 +563,9 @@ class FinancialCrimeService:
             conn.execute("UPDATE transactions SET entity_id=? WHERE entity_id=?", (target["id"], source["id"]))
             conn.execute("UPDATE alerts SET entity_id=? WHERE entity_id=?", (target["id"], source["id"]))
             conn.execute("UPDATE cases SET entity_id=?,version=version+1,updated_at=? WHERE entity_id=?", (target["id"], now, source["id"]))
+            chain_hook = getattr(self, "chain_merge_hook", None)
+            if chain_hook:
+                chain_hook(conn, source["id"], target["id"])
             details = {"source": source["canonical_name"], "target": target["canonical_name"], "aliases": aliases}
             conn.execute(
                 "INSERT INTO entity_merges(source_id,target_id,actor,details,created_at) VALUES(?,?,?,?,?)",
@@ -629,16 +640,29 @@ class FinancialCrimeService:
         customer = self.create_customer("analyst-demo", "analyst", entity["id"], "CUST-0001", "CN", "贸易", False, 0.2)
         self.add_or_update_watchlist("sup-demo", "supervisor", "OFAC", "海岳贸易有限公司", ["CN"])
         result = self.ingest_transaction("analyst-demo", "analyst", "TXN-DEMO-0001", customer["id"], 150000, "USD", "海岳贸易有限公司", "CN")
-        return {"seeded": True, "entity_id": entity["id"], "customer_id": customer["id"], "alert_id": result["alert"]["id"] if result["alert"] else None}
+        case_id = None
+        if result["alert"]:
+            case_id = self.triage_alert("inv-demo", "investigator", result["alert"]["id"], "escalate", "inv-demo", "CASE-DEMO-0001")["case"]["id"]
+        return {"seeded": True, "entity_id": entity["id"], "customer_id": customer["id"],
+                "alert_id": result["alert"]["id"] if result["alert"] else None, "case_id": case_id}
 
 
 class ApiHandler(BaseHTTPRequestHandler):
     service: FinancialCrimeService
+    chain_service: ChainService
 
     def _send(self, status: int, payload: Any) -> None:
         body = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_page(self, name: str) -> None:
+        body = (ROOT / "static" / name).read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -664,12 +688,10 @@ class ApiHandler(BaseHTTPRequestHandler):
         try:
             path = urlparse(self.path).path
             if path in {"/", "/index.html"}:
-                body = (ROOT / "static" / "index.html").read_bytes()
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+                self._send_page("index.html")
+                return
+            if path == "/chain.html":
+                self._send_page("chain.html")
                 return
             actor, role = self._headers()
             if path == "/health":
@@ -677,10 +699,21 @@ class ApiHandler(BaseHTTPRequestHandler):
             elif path == "/api/state":
                 self._send(200, self.service.state(actor, role))
             elif path.startswith("/api/cases/"):
-                self._send(200, self.service.get_case(actor, role, int(path.split("/")[3])))
+                parts = path.split("/")
+                if len(parts) == 5 and parts[4] == "chain":
+                    self._send(200, self.chain_service.case_chain(actor, role, int(parts[3])))
+                else:
+                    self._send(200, self.service.get_case(actor, role, int(parts[3])))
+            elif path.startswith("/api/chain/transfers/"):
+                parts = path.split("/")
+                if len(parts) == 6 and parts[5] == "expand":
+                    depth = parse_qs(urlparse(self.path).query).get("depth", ["3"])[0]
+                    self._send(200, self.chain_service.expand_transfer(actor, role, int(parts[4]), depth))
+                else:
+                    self._send(404, {"error": "接口不存在"})
             else:
                 self._send(404, {"error": "接口不存在"})
-        except DomainError as exc:
+        except (DomainError, ChainError) as exc:
             self._send(exc.status, {"error": str(exc)})
         except (ValueError, IndexError) as exc:
             self._send(400, {"error": str(exc)})
@@ -710,10 +743,12 @@ class ApiHandler(BaseHTTPRequestHandler):
                 result = self.service.merge_entities(actor, role, **data)
             elif path == "/api/cases/report":
                 result = self.service.file_report(actor, role, **data)
+            elif path == "/api/chain/transfers":
+                result = self.chain_service.register_transfer(actor, role, **data)
             else:
                 raise DomainError("接口不存在", 404)
             self._send(201, result)
-        except DomainError as exc:
+        except (DomainError, ChainError) as exc:
             self._send(exc.status, {"error": str(exc)})
         except (KeyError, TypeError, ValueError) as exc:
             self._send(400, {"error": "请求参数错误: %s" % exc})
@@ -724,8 +759,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         return
 
 
-def serve(service: FinancialCrimeService, host: str, port: int) -> None:
+def serve(service: FinancialCrimeService, chain_service: ChainService, host: str, port: int) -> None:
     ApiHandler.service = service
+    ApiHandler.chain_service = chain_service
     server = ThreadingHTTPServer((host, port), ApiHandler)
     print("Financial crime service listening on http://%s:%s" % (host, port))
     server.serve_forever()
@@ -740,10 +776,17 @@ def main() -> None:
     parser.add_argument("--seed", action="store_true")
     args = parser.parse_args()
     service = FinancialCrimeService(args.db)
+    chain_service = ChainService(args.db, name_similarity, HIGH_RISK_COUNTRIES)
+    service.chain_freeze_hook = chain_service.on_entity_frozen
+    service.chain_unfreeze_hook = chain_service.on_entity_unfrozen
+    service.chain_merge_hook = chain_service.on_entity_merged
     if args.init:
-        print(json.dumps(service.seed_demo() if args.seed else {"initialized": True, "db": args.db}, ensure_ascii=False))
+        info = service.seed_demo() if args.seed else {"initialized": True, "db": args.db}
+        if args.seed and info.get("seeded"):
+            info["chain"] = chain_service.seed_demo(case_id=info.get("case_id"))
+        print(json.dumps(info, ensure_ascii=False))
         return
-    serve(service, args.host, args.port)
+    serve(service, chain_service, args.host, args.port)
 
 
 if __name__ == "__main__":

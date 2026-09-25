@@ -1,0 +1,59 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>资金链路调查</title>
+<style>
+body{font:15px/1.6 system-ui,sans-serif;max-width:1200px;margin:28px auto;padding:0 20px;color:#24313c}
+table{border-collapse:collapse;width:100%;margin:14px 0}th,td{border:1px solid #d3dce3;padding:7px}th{background:#eef4f7}
+.card{background:#f7f2ff;border-left:5px solid #7256b7;padding:12px 16px;margin-bottom:14px}
+code{background:#edf0f2;padding:2px 5px}input{padding:4px 6px}button{padding:4px 12px;cursor:pointer}
+.b{display:inline-block;border-radius:3px;padding:1px 7px;margin:1px 3px 1px 0;font-size:13px;color:#fff}
+.san{background:#c0392b}.risk{background:#e67e22}.frz{background:#34495e}
+tr.blocked{background:#fdecea}tr.frozen{background:#fdf3e3}.muted{color:#7a8a97}
+</style>
+<h1>资金链路调查</h1>
+<div class="card">
+  身份 <input id="u" placeholder="X-User" size="10"> <input id="r" placeholder="X-Role" size="12">
+  <button onclick="saveAuth()">保存身份</button><br><br>
+  从任意一笔展开：转账 ID <input id="tid" size="6"> 层数 <input id="dep" size="2" value="3">
+  <button onclick="expand()">展开前后节点</button>
+  &nbsp;｜&nbsp; 案件链路：案件 ID <input id="cid" size="6"> <button onclick="loadCase()">查看案件链路</button>
+  &nbsp;｜&nbsp; <a href="/">返回主页</a>
+</div>
+<h2 id="title" class="muted">请输入转账 ID 或案件 ID</h2>
+<h3>节点（账户）</h3>
+<table id="nodes"><thead><tr><th>账号</th><th>持有人</th><th>国家</th><th>标记</th></tr></thead><tbody></tbody></table>
+<h3>转账边</h3>
+<table id="edges"><thead><tr><th>ID</th><th>业务编号</th><th>上游账户</th><th>下游账户</th><th>金额</th><th>币种</th><th>状态</th><th>时间</th><th></th></tr></thead><tbody></tbody></table>
+<script>
+const STATUS={recorded:'已登记',review:'待复核',frozen_review:'冻结复核',blocked:'已阻断'};
+const $=s=>document.querySelector(s);
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+$('#u').value=localStorage.u||'sup-demo';$('#r').value=localStorage.r||'supervisor';
+function saveAuth(){localStorage.u=$('#u').value;localStorage.r=$('#r').value;load()}
+const hdr=()=>({'X-User':$('#u').value,'X-Role':$('#r').value});
+function badges(n){let h='';if(n.sanctioned)h+='<span class="b san">制裁命中</span>';if(n.high_risk)h+='<span class="b risk">高风险国家</span>';if(n.frozen)h+='<span class="b frz">已冻结</span>';return h||'<span class="muted">—</span>'}
+function render(d,title){
+  $('#title').textContent=title+(d.truncated?'（结果过大已截断）':'');
+  const acc={};(d.nodes||[]).forEach(n=>acc[n.id]=n);
+  $('#nodes tbody').innerHTML=(d.nodes||[]).map(n=>
+    `<tr><td>${esc(n.account_no)}</td><td>${esc(n.holder_name)}</td><td>${esc(n.country)}</td><td>${badges(n)}</td></tr>`).join('');
+  $('#edges tbody').innerHTML=(d.edges||[]).map(e=>{
+    const cls=e.status==='blocked'?'blocked':(e.status==='frozen_review'?'frozen':'');
+    const f=acc[e.from_account_id],t=acc[e.to_account_id];
+    return `<tr class="${cls}"><td>${e.id}</td><td>${esc(e.biz_ref)}</td>`+
+      `<td>${esc(f?f.account_no:e.from_account_id)}</td><td>${esc(t?t.account_no:e.to_account_id)}</td>`+
+      `<td>${e.amount}</td><td>${esc(e.currency)}</td><td>${STATUS[e.status]||esc(e.status)}</td>`+
+      `<td>${esc(e.created_at)}</td><td><a href="/chain.html?transfer=${e.id}">展开</a></td></tr>`}).join('');
+}
+async function go(url,title){
+  const r=await fetch(url,{headers:hdr()});const d=await r.json();
+  if(!r.ok){$('#title').textContent='错误：'+(d.error||r.status);return}
+  render(d,title);
+}
+function expand(){go('/api/chain/transfers/'+encodeURIComponent($('#tid').value)+'/expand?depth='+encodeURIComponent($('#dep').value),'转账 #'+$('#tid').value+' 的前后端展开')}
+function loadCase(){go('/api/cases/'+encodeURIComponent($('#cid').value)+'/chain','案件 #'+$('#cid').value+' 的资金链路')}
+function load(){
+  const q=new URLSearchParams(location.search);
+  if(q.get('transfer')){$('#tid').value=q.get('transfer');if(q.get('depth'))$('#dep').value=q.get('depth');expand()}
+  else if(q.get('case')){$('#cid').value=q.get('case');loadCase()}
+}
+load()
+</script></html>
