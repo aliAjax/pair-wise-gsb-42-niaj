@@ -1,7 +1,234 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>金融犯罪调查</title>
-<style>body{font:15px/1.6 system-ui,sans-serif;max-width:1200px;margin:28px auto;padding:0 20px;color:#24313c}table{border-collapse:collapse;width:100%;margin:14px 0}th,td{border:1px solid #d3dce3;padding:7px}th{background:#eef4f7}.card{background:#f7f2ff;border-left:5px solid #7256b7;padding:12px 16px}code{background:#edf0f2;padding:2px 5px}</style>
-<h1>金融犯罪调查与制裁筛查</h1><div class="card">案件严格按角色和调查员分配过滤。写入接口需要 <code>X-User</code>、<code>X-Role</code>。</div>
-<h2>案件</h2><table id="cases"><thead><tr><th>案件号</th><th>状态</th><th>风险</th><th>调查员</th><th>报告</th></tr></thead><tbody></tbody></table>
-<h2>交易</h2><table id="txns"><thead><tr><th>编号</th><th>金额</th><th>币种</th><th>状态</th><th>原因</th></tr></thead><tbody></tbody></table>
-<h2>审计时间线</h2><ol id="timeline"></ol>
-<script>async function load(){const d=await fetch('/api/state').then(r=>r.json());document.querySelector('#cases tbody').innerHTML=d.cases.map(r=>`<tr><td>${r.case_no}</td><td>${r.status}</td><td>${r.risk_score}</td><td>${r.assignee||''}</td><td>${r.report_ref||''}</td></tr>`).join('');document.querySelector('#txns tbody').innerHTML=d.transactions.map(r=>`<tr><td>${r.txn_ref}</td><td>${r.amount}</td><td>${r.currency}</td><td>${r.status}</td><td>${r.reason}</td></tr>`).join('');document.querySelector('#timeline').innerHTML=d.timeline.slice(0,20).map(x=>`<li>${x.created_at} ${x.action} ${x.details}</li>`).join('')}load()</script></html>
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>金融犯罪调查 · 资金链路</title>
+<style>
+  body{font:14px/1.6 system-ui,sans-serif;max-width:1280px;margin:24px auto;padding:0 18px;color:#24313c;background:#fafbfc}
+  h1{font-size:22px}h2{font-size:17px;margin:26px 0 8px}
+  table{border-collapse:collapse;width:100%;margin:10px 0;background:#fff}
+  th,td{border:1px solid #d3dce3;padding:6px 8px;font-size:13px;text-align:left}
+  th{background:#eef4f7}
+  .card{background:#f7f2ff;border-left:5px solid #7256b7;padding:10px 14px;margin:10px 0}
+  .bar{background:#fff;border:1px solid #d3dce3;padding:10px 14px;border-radius:6px;display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+  input,select,button,textarea{font:inherit;padding:5px 8px;border:1px solid #b9c5cf;border-radius:4px}
+  button{cursor:pointer;background:#315a7c;color:#fff;border-color:#315a7c;padding:5px 12px}
+  button.ghost{background:#fff;color:#315a7c}
+  button.danger{background:#a23636;border-color:#a23636}
+  button.ok{background:#2e7d4f;border-color:#2e7d4f}
+  code{background:#edf0f2;padding:1px 5px;border-radius:3px}
+  .tag{display:inline-block;border-radius:10px;padding:1px 9px;font-size:12px;margin:1px 2px;color:#fff}
+  .tag-sanctions{background:#a23636}.tag-high_risk_country{background:#c8741a}
+  .tag-frozen{background:#5b3aa5}.tag-none{background:#8394a1}
+  .st-review{color:#c8741a;font-weight:600}.st-blocked,.st-frozen_review{color:#a23636;font-weight:600}
+  .st-registered{color:#2e7d4f}.st-released{color:#2e7d4f}.st-upheld{color:#a23636}
+  tr.clickable{cursor:pointer}tr.clickable:hover{background:#f0f6fb}
+  #chainPanel{background:#fff;border:1px solid #d3dce3;border-radius:6px;padding:14px;margin-top:12px;display:none}
+  #graph{overflow-x:auto;border:1px solid #e2e8ed;border-radius:6px;background:#fcfdfe;margin:8px 0}
+  svg{display:block}
+  .node-rect{fill:#fff;stroke:#8394a1;stroke-width:1.5}
+  .node-hit{stroke:#a23636;stroke-width:2.5}
+  .node-frozen{fill:#f4eefc}
+  .edge-blocked{stroke:#a23636}.edge-review{stroke:#c8741a}.edge-ok{stroke:#5b7a92}
+  .edge-label{font-size:11px;fill:#41525f}.node-label{font-size:12px;fill:#24313c}
+  .muted{color:#6b7a87;font-size:12px}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  fieldset{border:1px solid #d3dce3;border-radius:6px;background:#fff;padding:10px 14px}
+  legend{font-weight:600;padding:0 6px}
+  #msg{min-height:20px;font-size:13px;margin-left:8px}
+  #msg.ok{color:#2e7d4f}#msg.err{color:#a23636}
+</style>
+<h1>金融犯罪调查与制裁筛查 · 资金链路</h1>
+<div class="bar">
+  <label>操作人 <input id="user" value="sup1" size="9"></label>
+  <label>角色
+    <select id="role">
+      <option value="supervisor" selected>主管 supervisor</option>
+      <option value="investigator">调查员 investigator</option>
+      <option value="analyst">分析员 analyst</option>
+      <option value="director">总监 director</option>
+      <option value="auditor">审计 auditor</option>
+    </select>
+  </label>
+  <button onclick="loadAll()">刷新</button>
+  <span id="msg"></span>
+</div>
+<div class="card">登记转账保留上下游账户与金额，同一业务编号重复提交只记一次；从任意一笔可向前后展开，命中制裁名单 / 高风险国家 / 已冻结的节点自动标记。写入接口走 <code>X-User</code>、<code>X-Role</code> 请求头。</div>
+
+<div class="grid2">
+<fieldset>
+  <legend>登记链路转账</legend>
+  <table>
+    <tr><th>业务编号</th><td><input id="bizRef" size="14" placeholder="BIZ-..."></td>
+        <th>金额/币种</th><td><input id="amount" size="8" value="100000"> <input id="currency" size="3" value="USD"></td></tr>
+    <tr><th>上游账户</th><td><input id="fromAcc" size="10"></td><th>户名/国家</th><td><input id="fromName" size="12"> <input id="fromCountry" size="2" value="CN"></td></tr>
+    <tr><th>下游账户</th><td><input id="toAcc" size="10"></td><th>户名/国家</th><td><input id="toName" size="12"> <input id="toCountry" size="2" value="HK"></td></tr>
+  </table>
+  <button onclick="registerTransfer()">登记转账</button>
+  <button class="ghost" onclick="showRegisterDemo()">填演示链路</button>
+</fieldset>
+<fieldset>
+  <legend>链路展开</legend>
+  <label>从转账ID <input id="expandTransfer" size="6"></label> 或
+  <label>账户ID <input id="expandAccount" size="6"></label>
+  <label>方向 <select id="direction"><option value="both">前后</option><option value="upstream">仅上游</option><option value="downstream">仅下游</option></select></label>
+  <label>层数 <input id="depth" size="3" value="6"></label>
+  <button onclick="expandChain()">展开</button>
+</fieldset>
+</div>
+
+<div id="chainPanel">
+  <h2 id="chainTitle" style="margin-top:4px"></h2>
+  <div id="chainSummary" class="muted"></div>
+  <div id="graph"></div>
+  <table id="chainNodes"><thead><tr><th>账户</th><th>持有人</th><th>国家</th><th>挂靠实体</th><th>跳数</th><th>风险标记</th></tr></thead><tbody></tbody></table>
+</div>
+
+<h2>案件（点击查看资金链路）</h2>
+<table id="cases"><thead><tr><th>案件号</th><th>状态</th><th>风险</th><th>调查员</th><th>冻结</th><th>报告</th></tr></thead><tbody></tbody></table>
+<table id="caseLinks" style="display:none"><tbody></tbody></table>
+
+<h2>链路转账</h2>
+<table id="transfers"><thead><tr><th>ID</th><th>业务编号</th><th>上游账户</th><th>下游账户</th><th>金额</th><th>状态</th><th>标记</th><th>案件</th><th></th></tr></thead><tbody></tbody></table>
+
+<h2>冻结复核队列</h2>
+<table id="reviews"><thead><tr><th>ID</th><th>业务编号</th><th>上游</th><th>下游</th><th>金额</th><th>冻结实体</th><th>状态</th><th>操作</th></tr></thead><tbody></tbody></table>
+
+<h2>客户筛查交易</h2>
+<table id="txns"><thead><tr><th>编号</th><th>金额</th><th>币种</th><th>状态</th><th>原因</th></tr></thead><tbody></tbody></table>
+<h2>审计时间线</h2>
+<ol id="timeline"></ol>
+
+<script>
+const $ = id => document.getElementById(id);
+function headers(){return {"X-User":$("user").value.trim()||"viewer","X-Role":$("role").value,"Content-Type":"application/json"};}
+function setMsg(t,ok){const m=$("msg");m.textContent=t;m.className=ok?"ok":"err";}
+const esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const FLAG_LABEL={sanctions:"制裁名单",high_risk_country:"高风险国家",frozen:"已冻结"};
+function flagTags(flags){if(!flags||!flags.length)return '<span class="tag tag-none">无</span>';
+  return flags.map(f=>`<span class="tag tag-${f.code||f.split(":").pop()}">${esc(FLAG_LABEL[f.code]||f.code||f)}</span>`).join("");}
+function stClass(s){return "st-"+s;}
+
+async function api(path,opts){const r=await fetch(path,opts);const d=await r.json();if(!r.ok)throw new Error(d.error||r.status);return d;}
+
+async function loadAll(){
+  try{
+    const d=await api("/api/state",{headers:headers()});
+    $("cases").querySelector("tbody").innerHTML=d.cases.map(c=>
+      `<tr class="clickable" onclick="loadCase(${c.id})"><td>${esc(c.case_no)}</td><td>${esc(c.status)}</td>
+      <td>${c.risk_score}</td><td>${esc(c.assignee||"")}</td><td>${c.freeze_target?"是":""}</td><td>${esc(c.report_ref||"")}</td></tr>`).join("");
+    const acc={};(d.chain_accounts||[]).forEach(a=>acc[a.id]=a);
+    $("transfers").querySelector("tbody").innerHTML=(d.chain_transfers||[]).map(t=>
+      `<tr><td>${t.id}</td><td>${esc(t.biz_ref)}</td>
+      <td>${t.from_account_id} ${esc(acc[t.from_account_id]?.holder_name||"")}</td>
+      <td>${t.to_account_id} ${esc(acc[t.to_account_id]?.holder_name||"")}</td>
+      <td>${t.amount} ${esc(t.currency)}</td><td class="${stClass(t.status)}">${esc(t.status)}</td>
+      <td>${(JSON.parse(t.flags||"[]")).map(f=>`<span class="tag tag-none" style="background:#5b7a92">${esc(f)}</span>`).join("")||""}</td>
+      <td>${t.case_id||""}</td>
+      <td><button class="ghost" onclick="$('expandTransfer').value=${t.id};expandChain()">展开</button></td></tr>`).join("");
+    $("reviews").querySelector("tbody").innerHTML=(d.freeze_reviews||[]).map(r=>
+      `<tr><td>${r.id}</td><td>${esc(r.biz_ref)}</td>
+      <td>${esc(r.from_holder)}<br><span class="muted">${esc(r.from_account_no)}</span></td>
+      <td>${esc(r.to_holder)}<br><span class="muted">${esc(r.to_account_no)}</span></td>
+      <td>${r.amount} ${esc(r.currency)}</td><td>${esc(r.frozen_entity_name)}</td>
+      <td class="${stClass("frozen_review")}">待复核</td>
+      <td><button class="ok" onclick="review(${r.id},'release')">放行</button>
+          <button class="danger" onclick="review(${r.id},'uphold')">维持阻断</button></td></tr>`).join("");
+    $("txns").querySelector("tbody").innerHTML=d.transactions.slice(0,50).map(r=>
+      `<tr><td>${esc(r.txn_ref)}</td><td>${r.amount}</td><td>${esc(r.currency)}</td>
+      <td class="${stClass(r.status)}">${esc(r.status)}</td><td>${esc(r.reason)}</td></tr>`).join("");
+    $("timeline").innerHTML=d.timeline.slice(0,25).map(x=>
+      `<li>${esc(x.created_at)} <b>${esc(x.action)}</b> ${esc(x.details)}</li>`).join("");
+    setMsg("已加载",true);
+  }catch(e){setMsg(e.message,false);}
+}
+
+async function registerTransfer(){
+  const body={biz_ref:$("bizRef").value.trim(),from_account_no:$("fromAcc").value.trim(),
+    to_account_no:$("toAcc").value.trim(),amount:Number($("amount").value),currency:$("currency").value.trim(),
+    from_holder:$("fromName").value.trim(),to_holder:$("toName").value.trim(),
+    from_country:$("fromCountry").value.trim(),to_country:$("toCountry").value.trim()};
+  try{
+    const d=await api("/api/chain/transfers",{method:"POST",headers:headers(),body:JSON.stringify(body)});
+    setMsg(d.duplicate?`业务编号 ${body.biz_ref} 已登记，只记一次（状态 ${d.transfer.status}）`
+                        :`已登记 ${body.biz_ref}：${d.transfer.status}`,true);
+    loadAll();
+  }catch(e){setMsg(e.message,false);}
+}
+
+async function expandChain(){
+  const p=new URLSearchParams();
+  if($("expandTransfer").value)p.set("transfer_id",$("expandTransfer").value);
+  if($("expandAccount").value)p.set("account_id",$("expandAccount").value);
+  p.set("direction",$("direction").value);p.set("max_depth",$("depth").value);
+  try{
+    const d=await api("/api/chain/expand?"+p.toString(),{headers:headers()});
+    renderGraph("资金链路展开",d);
+  }catch(e){setMsg(e.message,false);}
+}
+
+async function loadCase(id){
+  try{
+    const d=await api("/api/cases/"+id,{headers:headers()});
+    renderGraph("案件 "+d.case.case_no+" 的资金链路",d.chain);
+  }catch(e){setMsg(e.message,false);}
+}
+
+async function review(id,decision){
+  const reason=prompt(decision==="release"?"放行理由：":"维持阻断理由：");
+  if(reason===null)return;
+  try{
+    await api("/api/freeze-reviews/review",{method:"POST",headers:headers(),
+      body:JSON.stringify({review_id:id,decision,reason})});
+    setMsg("复核完成",true);loadAll();
+  }catch(e){setMsg(e.message,false);}
+}
+
+function renderGraph(title,d){
+  $("chainPanel").style.display="block";$("chainTitle").textContent=title;
+  const hits=d.nodes.filter(n=>n.flags.length);
+  $("chainSummary").innerHTML=`节点 ${d.nodes.length} 个，转账 ${d.edges.length} 笔，命中风险节点 <b>${d.hit_count}</b> 个，阻断/待复核边 ${d.blocked_edge_count} 条，最远 ${d.max_depth_reached} 跳`;
+  $("chainNodes").querySelector("tbody").innerHTML=d.nodes.map(n=>
+    `<tr><td>${esc(n.account_no)}</td><td>${esc(n.holder_name)}</td><td>${esc(n.country)}</td>
+    <td>${esc(n.entity_name||(n.entity_id?("#"+n.entity_id):""))}${n.entity_frozen?" 🔒":""}</td>
+    <td>${n.distance}</td><td>${flagTags(n.flags)} ${n.flags.map(f=>esc(f.detail)).join("；")}</td></tr>`).join("");
+  drawSvg(d);
+}
+
+// 极简分层布局：按 distance 分列，列内纵向排开
+function drawSvg(d){
+  const W=1180,colX={},cols={},padX=30,padY=24,colW=250,rowH=92;
+  d.nodes.forEach(n=>{(cols[n.distance]??=[]).push(n);});
+  Object.keys(cols).sort((a,b)=>a-b).forEach(dist=>{colX[dist]=padX+dist*colW;});
+  const maxRows=Math.max(...Object.values(cols).map(a=>a.length));
+  const H=Math.max(140,padY*2+maxRows*rowH);
+  const pos={};
+  Object.entries(cols).forEach(([dist,nodes])=>{
+    nodes.forEach((n,i)=>{pos[n.id]={x:colX[dist],y:padY+i*rowH};});
+  });
+  const edgePath=t=>{const a=pos[t.source],b=pos[t.target];
+    return `M${a.x+190},${a.y+26} C${a.x+220},${a.y+26} ${b.x-30},${b.y+26} ${b.x},${b.y+26}`;};
+  const edges=d.edges.map(t=>{
+    const cls=t.status==="blocked"||t.status==="frozen_review"?"edge-blocked":t.status==="review"?"edge-review":"edge-ok";
+    return `<path d="${edgePath(t)}" fill="none" class="${cls}" stroke-width="2" marker-end="url(#arrow-${cls})"/>
+      <text class="edge-label" x="${(pos[t.source].x+pos[t.target].x)/2+80}" y="${(pos[t.source].y+pos[t.target].y)/2+14}">${esc(t.bizRef||t.biz_ref)} ${t.amount} ${esc(t.currency)} · ${esc(t.status)}</text>`;
+  }).join("");
+  const defs=[...new Set(["edge-blocked","edge-review","edge-ok"])]
+    .map(c=>`<marker id="arrow-${c}" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" class="${c}"/></marker>`).join("");
+  const nodes=d.nodes.map(n=>{const p=pos[n.id];const hit=n.flags.some(f=>f.code==="sanctions"||f.code==="high_risk_country");
+    const frozen=n.entity_frozen;
+    return `<g><rect x="${p.x}" y="${p.y}" width="190" height="58" rx="6" class="node-rect ${hit?"node-hit":""} ${frozen?"node-frozen":""}"/>
+      <text class="node-label" x="${p.x+8}" y="${p.y+20}"><b>${esc(n.holder_name)}</b>${frozen?" 🔒":""}</text>
+      <text class="node-label muted" x="${p.x+8}" y="${p.y+37}">${esc(n.account_no)} · ${esc(n.country)}</text>
+      <text x="${p.x+8}" y="${p.y+53}">${n.flags.map(f=>`<tspan class="tag tag-${f.code}" style="font-size:10px">${esc(f.label)}</tspan>`).join(" ")}</text></g>`;
+  }).join("");
+  $("graph").innerHTML=`<svg width="${W}" height="${H}"><defs>${defs}</defs>${edges}${nodes}</svg>`;
+}
+
+function showRegisterDemo(){
+  [["bizRef","BIZ-001"],["fromAcc","ACC-CUST-1"],["toAcc","ACC-SHELL-A"],["amount","150000"],
+   ["currency","USD"],["fromName","海岳贸易有限公司"],["toName","空壳A公司"],["fromCountry","CN"],["toCountry","HK"]]
+   .forEach(([k,v])=>$(k).value=v);
+}
+loadAll();
+</script>
+</html>
